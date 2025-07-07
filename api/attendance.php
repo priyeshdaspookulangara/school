@@ -1,6 +1,9 @@
 <?php
 // api/attendance.php
 
+// sms_gateway.php is needed for send_sms and get_sms_setting
+require_once __DIR__ . '/../includes/sms_gateway.php';
+
 /**
  * Handles marking or updating attendance for multiple students.
  * POST /api/attendance/mark
@@ -75,6 +78,8 @@ function handleMarkAttendance(mysqli $db) {
 
     // Begin transaction for atomic operations
     $db->begin_transaction();
+    $smsNotificationsSent = 0;
+    $smsNotificationsFailed = 0;
 
     try {
         foreach ($data['records'] as $record) {
@@ -84,11 +89,15 @@ function handleMarkAttendance(mysqli $db) {
             }
 
             // Sanitize record inputs
-            $student_id = mysqli_real_escape_string($db, $record['student_id']);
-            $status = mysqli_real_escape_string($db, $record['status']);
+            $student_id_input = $record['student_id']; // Keep original for messages before sanitizing for SQL
+            $status_input = $record['status']; // Keep original for messages
 
-            if (!in_array(strtolower($status), $allowedStatuses)) {
-                $failedRecords[] = ['student_id' => $record['student_id'], 'error' => "Invalid status: {$status}."];
+            $student_id = mysqli_real_escape_string($db, $student_id_input);
+            $status = mysqli_real_escape_string($db, $status_input);
+
+
+            if (!in_array(strtolower($status_input), $allowedStatuses)) {
+                $failedRecords[] = ['student_id' => $student_id_input, 'error' => "Invalid status: {$status_input}."];
                 continue;
             }
 
@@ -100,45 +109,172 @@ function handleMarkAttendance(mysqli $db) {
 
             if ($db->query($sql)) {
                 $successfulInserts++;
+
+                // If student is marked 'absent', trigger SMS notification
+                if (strtolower($status_input) === 'absent') {
+                    // **CRITICAL SECURITY WARNING**: The following SQL queries fetch data for SMS.
+                    // Ensure all parts of these queries, especially those involving variables like $student_id, $class_id, $date,
+                    // are derived from sanitized inputs or system-generated values.
+                    // $student_id, $class_id, $date are already sanitized above.
+
+                    // CUSTOMIZATION POINT: Define academic year start for accurate year_count
+                    // This example uses the calendar year. Adjust if your academic year is different.
+                    // E.g., by fetching 'academic_year_start_month_day' from sms_settings
+                    $academicYearStartSetting = get_sms_setting($db, 'academic_year_start_month_day'); // e.g., '06-01'
+                    $currentYear = date('Y');
+                    $currentMonth = date('m');
+                    $currentDay = date('d');
+
+                    if ($academicYearStartSetting && preg_match('/^(\d{2})-(\d{2})$/', $academicYearStartSetting, $matches)) {
+                        $startMonth = $matches[1];
+                        $startDay = $matches[2];
+                        if (mktime(0,0,0,$currentMonth, $currentDay, $currentYear) < mktime(0,0,0,$startMonth, $startDay, $currentYear) ) {
+                            $yearStartDate = ($currentYear - 1) . '-' . $startMonth . '-' . $startDay;
+                        } else {
+                            $yearStartDate = $currentYear . '-' . $startMonth . '-' . $startDay;
+                        }
+                    } else {
+                        // Default to calendar year if setting is missing or invalid
+                        $yearStartDate = $currentYear . "-01-01";
+                    }
+                    $monthStartDate = $currentYear . "-" . $currentMonth . "-01";
+
+
+                    // Query to fetch necessary data for the SMS template
+                    // Database Column Mappings (example, adjust to your schema):
+                    // {parent_name} -> COALESCE(parent_user.full_name, 'Guardian') (parent_user is hypothetical table)
+                    // {student_name} -> s.full_name (students table)
+                    // {roll_name} -> s.admission_no (students table)
+                    // {curr_date} -> $date (already available, formatted as YYYY-MM-DD)
+                    // {absent_count_curr_year} -> Calculated from attendance table
+                    // {absent_count_curr_month} -> Calculated from attendance table
+                    // {school_phone} -> Fetched from sms_settings
+                    // {class_teacher_name} -> COALESCE(teacher_user.full_name, 'School Office') (teacher_user is hypothetical)
+                    // Parent's mobile number -> parent_user.mobile_number
+
+                    // **SECURITY WARNING**: $student_id, $class_id, $date, $yearStartDate, $monthStartDate are used.
+                    // Ensure they are properly sanitized or generated. $student_id, $class_id, $date are sanitized.
+                    // $yearStartDate and $monthStartDate are generated from system date and sanitized settings.
+                    $smsDataSql = "
+                        SELECT
+                            s.full_name AS student_name,
+                            s.admission_no AS roll_name, -- Assuming admission_no is used as roll_name
+                            COALESCE(p_user.full_name, 'Guardian') AS parent_name,
+                            p_user.mobile_number AS parent_mobile_number, -- Assuming parent's mobile is in users table
+                            COALESCE(ct_user.full_name, 'School Office') AS class_teacher_name,
+                            (SELECT COUNT(*) FROM attendance att_year
+                             WHERE att_year.student_id = s.student_id AND att_year.status = 'absent'
+                             AND att_year.attendance_date >= '$yearStartDate' AND att_year.attendance_date <= '$date') AS absent_count_curr_year,
+                            (SELECT COUNT(*) FROM attendance att_month
+                             WHERE att_month.student_id = s.student_id AND att_month.status = 'absent'
+                             AND att_month.attendance_date >= '$monthStartDate' AND att_month.attendance_date <= '$date') AS absent_count_curr_month
+                        FROM
+                            students s
+                        LEFT JOIN
+                            users p_user ON s.parent_user_id = p_user.user_id -- CUSTOMIZATION: Adjust table/column names (e.g., students.parent_id -> parents.id)
+                        LEFT JOIN
+                            classes c ON s.class_id = c.class_id -- CUSTOMIZATION: Adjust if student not directly linked to class_id in students table
+                        LEFT JOIN
+                            users ct_user ON c.class_teacher_user_id = ct_user.user_id -- CUSTOMIZATION: Adjust table/column names
+                        WHERE
+                            s.student_id = '$student_id'
+                        LIMIT 1";
+
+                    $smsDataResult = $db->query($smsDataSql);
+                    if ($smsDataResult && $smsDataResult->num_rows > 0) {
+                        $smsData = $smsDataResult->fetch_assoc();
+                        $smsDataResult->free();
+
+                        $dailySmsTemplate = get_sms_setting($db, 'daily_absent_sms_template');
+                        $schoolPhone = get_sms_setting($db, 'school_phone');
+
+                        if ($dailySmsTemplate && !empty($smsData['parent_mobile_number'])) {
+                            $formattedCurrDate = date("d M Y", strtotime($date)); // Format date for display
+
+                            $placeholders = [
+                                '{parent_name}' => $smsData['parent_name'],
+                                '{student_name}' => $smsData['student_name'],
+                                '{roll_name}' => $smsData['roll_name'] ? $smsData['roll_name'] : 'N/A',
+                                '{curr_date}' => $formattedCurrDate,
+                                '{absent_count_curr_year}' => $smsData['absent_count_curr_year'],
+                                '{absent_count_curr_month}' => $smsData['absent_count_curr_month'],
+                                '{school_phone}' => $schoolPhone ? $schoolPhone : 'the school',
+                                '{class_teacher_name}' => $smsData['class_teacher_name'],
+                            ];
+                            $smsMessage = str_replace(array_keys($placeholders), array_values($placeholders), $dailySmsTemplate);
+
+                            if (send_sms($db, $smsData['parent_mobile_number'], $smsMessage)) {
+                                $smsNotificationsSent++;
+                                error_log("Daily absent SMS sent successfully to " . $smsData['parent_mobile_number'] . " for student " . $student_id_input);
+                            } else {
+                                $smsNotificationsFailed++;
+                                error_log("Failed to send daily absent SMS to " . $smsData['parent_mobile_number'] . " for student " . $student_id_input . ". Check SMS gateway logs.");
+                            }
+                        } else {
+                            if(empty($smsData['parent_mobile_number'])) {
+                                error_log("Cannot send daily absent SMS for student " . $student_id_input . ": Parent mobile number not found.");
+                            }
+                            if(!$dailySmsTemplate) {
+                                error_log("Cannot send daily absent SMS for student " . $student_id_input . ": Daily SMS template not found in settings.");
+                            }
+                            $smsNotificationsFailed++;
+                        }
+                    } else {
+                        error_log("Failed to fetch SMS data for student " . $student_id_input . ". SQL Error: " . $db->error);
+                        $smsNotificationsFailed++;
+                    }
+                } // end if status is 'absent'
+
             } else {
                 // **SECURITY WARNING:** Do not expose $db->error directly to clients in production.
                 // Log it securely on the server.
-                $failedRecords[] = ['student_id' => $record['student_id'], 'error' => 'Database error during insert/update.'];
-                // error_log("Attendance DB Error for student $student_id on $date: " . $db->error);
+                $failedRecords[] = ['student_id' => $student_id_input, 'error' => 'Database error during insert/update.'];
+                error_log("Attendance DB Error for student $student_id_input on $date: " . $db->error);
             }
-        }
+        } // end foreach
+
+        $finalMessage = "";
+        $responseCode = 0;
 
         if (count($failedRecords) > 0 && $successfulInserts === 0) {
-            // If all records failed, roll back
             $db->rollback();
-            http_response_code(400); // Or 500 if server-side errors caused all failures
-            echo json_encode([
+            $responseCode = 400; // Or 500 if server-side errors caused all failures
+            $finalMessageData = [
                 'error' => 'Failed to mark attendance for all records.',
                 'failed_records' => $failedRecords
-            ]);
+            ];
         } elseif (count($failedRecords) > 0) {
-            // Partial success, commit successful ones
-            $db->commit();
-            http_response_code(207); // Multi-Status
-            echo json_encode([
+            $db->commit(); // Commit successful ones
+            $responseCode = 207; // Multi-Status
+            $finalMessageData = [
                 'message' => 'Attendance marked with some failures.',
                 'successful_inserts' => $successfulInserts,
-                'failed_records' => $failedRecords
-            ]);
+                'failed_records' => $failedRecords,
+            ];
         } else {
-            // All successful
             $db->commit();
-            http_response_code(201); // Created (or 200 OK if considering it an update)
-            echo json_encode([
+            $responseCode = 201; // Created (or 200 OK if considering it an update)
+            $finalMessageData = [
                 'message' => 'Attendance marked successfully for all students.',
-                'successful_inserts' => $successfulInserts
-            ]);
+                'successful_inserts' => $successfulInserts,
+            ];
         }
+
+        if ($smsNotificationsSent > 0 || $smsNotificationsFailed > 0) {
+             $finalMessageData['sms_notifications'] = [
+                'sent' => $smsNotificationsSent,
+                'failed' => $smsNotificationsFailed
+             ];
+        }
+
+        http_response_code($responseCode);
+        echo json_encode($finalMessageData);
+
     } catch (Exception $e) {
         $db->rollback();
         http_response_code(500);
         // **SECURITY WARNING:** Do not expose exception messages directly. Log them.
-        // error_log("Transaction failed for marking attendance: " . $e->getMessage());
+        error_log("Transaction failed for marking attendance: " . $e->getMessage());
         echo json_encode(['error' => 'An unexpected error occurred while processing attendance.']);
     }
 }

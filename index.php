@@ -6,6 +6,11 @@ header("Content-Type: application/json"); // All responses will be JSON
 
 require_once __DIR__ . '/includes/db_connect.php';
 require_once __DIR__ . '/includes/auth.php';
+// It's good practice to include sms_gateway.php here if multiple handlers might use it,
+// or include it directly within handlers that need it.
+// For now, specific handlers (attendance, sms_alert) already include it.
+// require_once __DIR__ . '/includes/sms_gateway.php';
+
 
 // Get the request method and path
 $requestMethod = $_SERVER['REQUEST_METHOD'];
@@ -21,6 +26,31 @@ switch ($requestPath) {
         } else {
             http_response_code(405); // Method Not Allowed
             echo json_encode(['error' => 'Method Not Allowed']);
+        }
+        break;
+
+    // SMS Threshold Alerts Endpoint
+    case '/api/sms/send-threshold-alerts':
+        if ($requestMethod == 'POST') {
+            require_once __DIR__ . '/api/sms_alert_handler.php'; // Ensure this file exists
+            handleSendThresholdAlerts($db); // Assumes $db is the global database connection
+        } else {
+            http_response_code(405);
+            echo json_encode(['error' => 'Method Not Allowed']);
+        }
+        break;
+
+    // Admin SMS Settings Endpoints
+    case '/api/admin/sms_settings':
+        if ($requestMethod == 'GET') {
+            require_once __DIR__ . '/api/admin_sms_settings_handler.php'; // Ensure this file exists
+            handleGetSmsSettings($db);
+        } elseif ($requestMethod == 'POST') {
+            require_once __DIR__ . '/api/admin_sms_settings_handler.php'; // Ensure this file exists
+            handleUpdateSmsSettings($db);
+        } else {
+            http_response_code(405);
+            echo json_encode(['error' => 'Method Not Allowed for this endpoint. Use GET or POST.']);
         }
         break;
 
