@@ -75,5 +75,34 @@ ON DUPLICATE KEY UPDATE `setting_value` = VALUES(`setting_value`), `description`
 */
 -- The PHP code will need to be adjusted to use such a setting.
 
+-- New settings for WhatsApp and Communication Channel Control (added on YYYY-MM-DD)
+
+INSERT INTO `sms_settings` (`setting_key`, `setting_value`, `description`) VALUES
+('daily_absent_whatsapp_template', 'Hello {parent_name}, your child {student_name} ({roll_name}) was absent today {curr_date}. This is their {absent_count_curr_year}th absence this year and {absent_count_curr_month}th this month. Please contact {school_phone} or {class_teacher_name} regarding this.', 'Template for daily WhatsApp messages to parents of absent students. Ensure this template is pre-approved by your WhatsApp Business API provider if required.')
+ON DUPLICATE KEY UPDATE `setting_value` = VALUES(`setting_value`), `description` = VALUES(`description`);
+
+INSERT INTO `sms_settings` (`setting_key`, `setting_value`, `description`) VALUES
+('absent_threshold_whatsapp_template', 'Attention {parent_name}! Your child {student_name} ({roll_name}) has now accumulated {absent_count_curr_year} absences this year ({absent_count_curr_month} this month), exceeding the school''s threshold. We urge you to contact {school_phone} or {class_teacher_name} at your earliest convenience.', 'Template for WhatsApp message when a student exceeds the absence threshold. Ensure pre-approval if required by WhatsApp Business API provider.')
+ON DUPLICATE KEY UPDATE `setting_value` = VALUES(`setting_value`), `description` = VALUES(`description`);
+
+INSERT INTO `sms_settings` (`setting_key`, `setting_value`, `description`) VALUES
+('default_comm_channel', 'both', 'Default communication channel for notifications. Options: sms, whatsapp, both, none.')
+ON DUPLICATE KEY UPDATE `setting_value` = VALUES(`setting_value`), `description` = VALUES(`description`);
+
+-- CUSTOMIZATION POINT: WhatsApp Gateway Configuration (add as needed)
+/*
+INSERT INTO `sms_settings` (`setting_key`, `setting_value`, `description`) VALUES
+('whatsapp_gateway_api_url', 'YOUR_WHATSAPP_GATEWAY_API_URL', 'API URL for your WhatsApp Business API provider.')
+ON DUPLICATE KEY UPDATE `setting_value` = VALUES(`setting_value`), `description` = VALUES(`description`);
+
+INSERT INTO `sms_settings` (`setting_key`, `setting_value`, `description`) VALUES
+('whatsapp_gateway_api_token', 'YOUR_WHATSAPP_GATEWAY_TOKEN', 'Authentication token for the WhatsApp Business API.')
+ON DUPLICATE KEY UPDATE `setting_value` = VALUES(`setting_value`), `description` = VALUES(`description`);
+
+INSERT INTO `sms_settings` (`setting_key`, `setting_value`, `description`) VALUES
+('whatsapp_gateway_phone_number_id', 'YOUR_WHATSAPP_PHONE_NUMBER_ID', 'Phone Number ID from your WhatsApp Business API provider.')
+ON DUPLICATE KEY UPDATE `setting_value` = VALUES(`setting_value`), `description` = VALUES(`description`);
+*/
+
 -- End of Database Modifications
 -- Remember to execute these SQL statements against your database.

@@ -113,10 +113,25 @@ function handleUpdateSmsSettings(mysqli $db) {
     $failedUpdates = [];
 
     // Define a whitelist of updatable setting keys for extra security, if desired.
-    // $allowedKeys = ['daily_absent_sms_template', 'absent_threshold_count', ...];
+    $allowedKeys = [
+        'daily_absent_sms_template',
+        'absent_threshold_count',
+        'absent_threshold_sms_template',
+        'school_phone',
+        'sms_gateway_api_url',
+        'sms_gateway_api_key',
+        'sms_gateway_sender_id',
+        'academic_year_start_month_day',
+        'daily_absent_whatsapp_template',      // New
+        'absent_threshold_whatsapp_template',  // New
+        'default_comm_channel',                // New
+        'whatsapp_gateway_api_url',            // New (if you add it)
+        'whatsapp_gateway_api_token',          // New (if you add it)
+        'whatsapp_gateway_phone_number_id'     // New (if you add it)
+    ];
 
     foreach ($settingsToUpdate as $setting) {
-        if (!isset($setting['setting_key']) || !isset($setting['setting_value'])) {
+        if (!isset($setting['setting_key']) || !array_key_exists('setting_value', $setting)) { // Check array_key_exists for potentially empty but intentional values
             $failedUpdates[] = ['item' => $setting, 'error' => 'Missing setting_key or setting_value.'];
             continue;
         }
@@ -129,13 +144,25 @@ function handleUpdateSmsSettings(mysqli $db) {
         $value = mysqli_real_escape_string($db, $setting['setting_value']); // Value can be long, so TEXT type is appropriate
         $description = isset($setting['description']) ? mysqli_real_escape_string($db, $setting['description']) : null;
 
-        // Optional: Validate $key against a whitelist of allowed setting keys
-        // if (!in_array($setting['setting_key'], $allowedKeys)) {
-        //     $failedUpdates[] = ['key' => $setting['setting_key'], 'error' => 'Invalid or not updatable setting_key.'];
-        //     continue;
-        // }
+        // Validate $key against a whitelist of allowed setting keys
+        if (!in_array($setting['setting_key'], $allowedKeys)) {
+            $failedUpdates[] = ['key' => $setting['setting_key'], 'error' => 'Invalid or not updatable setting_key.'];
+            continue;
+        }
 
-        if (empty($key)) {
+        // Specific validation for default_comm_channel
+        if ($key === 'default_comm_channel') {
+            $allowedCommValues = ['sms', 'whatsapp', 'both', 'none'];
+            if (!in_array(strtolower($setting['setting_value']), $allowedCommValues)) {
+                $failedUpdates[] = ['key' => $setting['setting_key'], 'value' => $setting['setting_value'], 'error' => 'Invalid value for default_comm_channel. Allowed: sms, whatsapp, both, none.'];
+                continue;
+            }
+            // Ensure value is stored in lowercase for consistency
+            $value = mysqli_real_escape_string($db, strtolower($setting['setting_value']));
+        }
+
+
+        if (empty($key)) { // This check is somewhat redundant if using the $allowedKeys whitelist correctly
             $failedUpdates[] = ['item' => $setting, 'error' => 'setting_key cannot be empty.'];
             continue;
         }

@@ -6,9 +6,10 @@
 require_once __DIR__ . '/../includes/db_connect.php';
 require_once __DIR__ . '/../includes/auth.php'; // For isAuthenticated and isAuthorized
 require_once __DIR__ . '/../includes/sms_gateway.php'; // For get_sms_setting and send_sms
+require_once __DIR__ . '/../includes/whatsapp_gateway.php'; // For WhatsApp messaging
 
 /**
- * Handles sending SMS alerts to students who have exceeded the absence threshold.
+ * Handles sending SMS and/or WhatsApp alerts to students who have exceeded the absence threshold.
  * POST /api/sms/send-threshold-alerts
  *
  * @param mysqli $db Database connection object.
@@ -28,16 +29,59 @@ function handleSendThresholdAlerts(mysqli $db) {
     }
 
     // --------------------------------------------------------------------------
-    // 2. Retrieve SMS Settings
+    // 2. Retrieve Communication Settings
     // --------------------------------------------------------------------------
     $absentThresholdCount = (int)get_sms_setting($db, 'absent_threshold_count');
-    $thresholdSmsTemplate = get_sms_setting($db, 'absent_threshold_sms_template');
-    $schoolPhone = get_sms_setting($db, 'school_phone');
+    $defaultCommChannel = get_sms_setting($db, 'default_comm_channel');
+    $schoolPhone = get_sms_setting($db, 'school_phone'); // Common for both
 
-    if ($absentThresholdCount <= 0 || empty($thresholdSmsTemplate)) {
+    if (empty($defaultCommChannel)) {
+        $defaultCommChannel = 'sms'; // Fallback if not set
+        error_log("Warning: 'default_comm_channel' for threshold alerts not found in settings, defaulting to '$defaultCommChannel'.");
+    }
+
+    $thresholdSmsTemplate = null;
+    if ($defaultCommChannel === 'sms' || $defaultCommChannel === 'both') {
+        $thresholdSmsTemplate = get_sms_setting($db, 'absent_threshold_sms_template');
+        if (empty($thresholdSmsTemplate)) {
+            error_log("SMS Threshold Alert Error: SMS template ('absent_threshold_sms_template') is missing for the selected communication channel.");
+            // Potentially continue if WhatsApp is also an option, or fail here. For now, we'll log and proceed.
+        }
+    }
+
+    $thresholdWhatsappTemplate = null;
+    if ($defaultCommChannel === 'whatsapp' || $defaultCommChannel === 'both') {
+        $thresholdWhatsappTemplate = get_sms_setting($db, 'absent_threshold_whatsapp_template');
+        if (empty($thresholdWhatsappTemplate)) {
+            error_log("WhatsApp Threshold Alert Error: WhatsApp template ('absent_threshold_whatsapp_template') is missing for the selected communication channel.");
+        }
+    }
+
+    if ($absentThresholdCount <= 0) {
         http_response_code(500); // Server Configuration Error
-        echo json_encode(['error' => 'SMS threshold settings (count or template) are not properly configured.']);
-        error_log("SMS Threshold Alert Error: Absent threshold count or template not configured.");
+        echo json_encode(['error' => 'Absent threshold count is not properly configured.']);
+        error_log("Threshold Alert Error: Absent threshold count is zero or not configured.");
+        return;
+    }
+    if (($defaultCommChannel === 'sms' || $defaultCommChannel === 'both') && empty($thresholdSmsTemplate)) {
+         if (!(($defaultCommChannel === 'whatsapp' || $defaultCommChannel === 'both') && !empty($thresholdWhatsappTemplate))) {
+            // If SMS is expected but template missing, AND WhatsApp isn't a valid fallback
+            http_response_code(500);
+            echo json_encode(['error' => 'SMS communication channel is enabled but SMS template is missing.']);
+            return;
+         }
+    }
+    if (($defaultCommChannel === 'whatsapp' || $defaultCommChannel === 'both') && empty($thresholdWhatsappTemplate)) {
+        if (!(($defaultCommChannel === 'sms' || $defaultCommChannel === 'both') && !empty($thresholdSmsTemplate))) {
+            // If WhatsApp is expected but template missing, AND SMS isn't a valid fallback
+            http_response_code(500);
+            echo json_encode(['error' => 'WhatsApp communication channel is enabled but WhatsApp template is missing.']);
+            return;
+        }
+    }
+    if ($defaultCommChannel === 'none') {
+        http_response_code(200);
+        echo json_encode(['status' => 'success', 'message' => 'Communication channel is set to none. No alerts sent.']);
         return;
     }
 
@@ -139,16 +183,25 @@ function handleSendThresholdAlerts(mysqli $db) {
     $alertedStudentsList = [];
     $smsSentCount = 0;
     $smsFailedCount = 0;
+    $whatsappSentCount = 0; // New counter
+    $whatsappFailedCount = 0; // New counter
 
     if ($result->num_rows === 0) {
         http_response_code(200);
-        echo json_encode([
+        $responsePayload = [
             'status' => 'success',
             'message' => 'No students found exceeding the absence threshold.',
             'students_alerted_count' => 0,
-            'sms_sent_count' => 0,
-            'sms_failed_count' => 0
-        ]);
+        ];
+        if ($defaultCommChannel === 'sms' || $defaultCommChannel === 'both') {
+            $responsePayload['sms_sent_count'] = 0;
+            $responsePayload['sms_failed_count'] = 0;
+        }
+        if ($defaultCommChannel === 'whatsapp' || $defaultCommChannel === 'both') {
+            $responsePayload['whatsapp_sent_count'] = 0;
+            $responsePayload['whatsapp_failed_count'] = 0;
+        }
+        echo json_encode($responsePayload);
         $result->free();
         return;
     }
@@ -175,42 +228,68 @@ function handleSendThresholdAlerts(mysqli $db) {
             '{school_phone}' => $schoolPhone ? $schoolPhone : 'the school',
             '{class_teacher_name}' => $studentData['class_teacher_name'],
         ];
-        $smsMessage = str_replace(array_keys($placeholders), array_values($placeholders), $thresholdSmsTemplate);
 
-        if (send_sms($db, $studentData['parent_mobile_number'], $smsMessage)) {
-            $smsSentCount++;
-            $alertedStudentsList[] = [
-                'student_id' => $studentData['student_id'],
-                'student_name' => $studentData['student_name'],
-                'parent_mobile' => $studentData['parent_mobile_number'],
-                'status' => 'SMS Sent'
-            ];
-            error_log("Threshold SMS sent to " . $studentData['parent_mobile_number'] . " for student " . $studentData['student_id']);
-        } else {
+        $studentAlertStatus = ['student_id' => $studentData['student_id'], 'name' => $studentData['student_name'], 'mobile' => $studentData['parent_mobile_number'], 'sms_status' => 'not_attempted', 'whatsapp_status' => 'not_attempted'];
+
+        // Send SMS if channel is 'sms' or 'both' AND template is available
+        if (($defaultCommChannel === 'sms' || $defaultCommChannel === 'both') && !empty($thresholdSmsTemplate)) {
+            $smsMessage = str_replace(array_keys($placeholders), array_values($placeholders), $thresholdSmsTemplate);
+            if (send_sms($db, $studentData['parent_mobile_number'], $smsMessage)) {
+                $smsSentCount++;
+                $studentAlertStatus['sms_status'] = 'sent';
+                error_log("Threshold SMS sent to " . $studentData['parent_mobile_number'] . " for student " . $studentData['student_id']);
+            } else {
+                $smsFailedCount++;
+                $studentAlertStatus['sms_status'] = 'failed';
+                error_log("Failed to send threshold SMS to " . $studentData['parent_mobile_number'] . " for student " . $studentData['student_id']);
+            }
+        } elseif (($defaultCommChannel === 'sms' || $defaultCommChannel === 'both') && empty($thresholdSmsTemplate)) {
             $smsFailedCount++;
-            $alertedStudentsList[] = [
-                'student_id' => $studentData['student_id'],
-                'student_name' => $studentData['student_name'],
-                'parent_mobile' => $studentData['parent_mobile_number'],
-                'status' => 'SMS Failed'
-            ];
-            error_log("Failed to send threshold SMS to " . $studentData['parent_mobile_number'] . " for student " . $studentData['student_id']);
+            $studentAlertStatus['sms_status'] = 'failed_template_missing';
+            error_log("Threshold SMS not sent for student " . $studentData['student_id'] . ": SMS template missing.");
         }
+
+
+        // Send WhatsApp if channel is 'whatsapp' or 'both' AND template is available
+        if (($defaultCommChannel === 'whatsapp' || $defaultCommChannel === 'both') && !empty($thresholdWhatsappTemplate)) {
+            // CUSTOMIZATION: Adapt for WhatsApp template name and parameters if needed
+            $whatsappMessage = str_replace(array_keys($placeholders), array_values($placeholders), $thresholdWhatsappTemplate);
+            if (send_whatsapp_message($db, $studentData['parent_mobile_number'], $whatsappMessage)) {
+                $whatsappSentCount++;
+                $studentAlertStatus['whatsapp_status'] = 'sent';
+                error_log("Threshold WhatsApp sent to " . $studentData['parent_mobile_number'] . " for student " . $studentData['student_id']);
+            } else {
+                $whatsappFailedCount++;
+                $studentAlertStatus['whatsapp_status'] = 'failed';
+                error_log("Failed to send threshold WhatsApp to " . $studentData['parent_mobile_number'] . " for student " . $studentData['student_id']);
+            }
+        } elseif (($defaultCommChannel === 'whatsapp' || $defaultCommChannel === 'both') && empty($thresholdWhatsappTemplate)) {
+            $whatsappFailedCount++;
+            $studentAlertStatus['whatsapp_status'] = 'failed_template_missing';
+            error_log("Threshold WhatsApp not sent for student " . $studentData['student_id'] . ": WhatsApp template missing.");
+        }
+        $alertedStudentsList[] = $studentAlertStatus;
     }
     $result->free();
 
     // --------------------------------------------------------------------------
     // 6. Return JSON Response
     // --------------------------------------------------------------------------
-    http_response_code(200);
-    echo json_encode([
+    $responsePayload = [
         'status' => 'success',
-        'message' => "Threshold alert process completed. SMS Sent: $smsSentCount, SMS Failed: $smsFailedCount.",
+        'message' => "Threshold alert process completed.",
         'students_processed_count' => count($alertedStudentsList),
-        'sms_sent_count' => $smsSentCount,
-        'sms_failed_count' => $smsFailedCount,
-        'alerted_students_details' => $alertedStudentsList // Optional: provide details
-    ]);
+    ];
+    if ($defaultCommChannel === 'sms' || $defaultCommChannel === 'both') {
+        $responsePayload['sms_notifications'] = ['sent' => $smsSentCount, 'failed' => $smsFailedCount];
+    }
+    if ($defaultCommChannel === 'whatsapp' || $defaultCommChannel === 'both') {
+        $responsePayload['whatsapp_notifications'] = ['sent' => $whatsappSentCount, 'failed' => $whatsappFailedCount];
+    }
+    $responsePayload['alerted_students_details'] = $alertedStudentsList; // Optional: provide details
+
+    http_response_code(200);
+    echo json_encode($responsePayload);
 }
 
 ?>

@@ -3,6 +3,7 @@
 
 // sms_gateway.php is needed for send_sms and get_sms_setting
 require_once __DIR__ . '/../includes/sms_gateway.php';
+require_once __DIR__ . '/../includes/whatsapp_gateway.php'; // For WhatsApp messaging
 
 /**
  * Handles marking or updating attendance for multiple students.
@@ -13,8 +14,8 @@ require_once __DIR__ . '/../includes/sms_gateway.php';
  *   "class_id": "C101",
  *   "date": "YYYY-MM-DD",
  *   "records": [
- *     { "student_id": "S1001", "status": "present" }, // status can be 'present', 'absent', 'late', 'excused'
- *     { "student_id": "S1002", "status": "absent" }
+ *     { "student_id": "S1001", "status": "present", "comm_channel": "both" }, // status: 'present', 'absent', 'late', 'excused'
+ *     { "student_id": "S1002", "status": "absent", "comm_channel": "sms" }  // comm_channel: 'sms', 'whatsapp', 'both', 'none' (optional, defaults to system setting)
  *   ]
  * }
  */
@@ -80,6 +81,15 @@ function handleMarkAttendance(mysqli $db) {
     $db->begin_transaction();
     $smsNotificationsSent = 0;
     $smsNotificationsFailed = 0;
+    $whatsappNotificationsSent = 0; // New counter
+    $whatsappNotificationsFailed = 0; // New counter
+
+    // Get default communication channel from settings, to be used if not provided in record
+    $defaultCommChannelSystem = get_sms_setting($db, 'default_comm_channel');
+    if (empty($defaultCommChannelSystem)) {
+        $defaultCommChannelSystem = 'sms'; // Fallback if not set, or choose 'none'
+        error_log("Warning: 'default_comm_channel' not found in settings, defaulting to '$defaultCommChannelSystem'.");
+    }
 
     try {
         foreach ($data['records'] as $record) {
@@ -90,10 +100,19 @@ function handleMarkAttendance(mysqli $db) {
 
             // Sanitize record inputs
             $student_id_input = $record['student_id']; // Keep original for messages before sanitizing for SQL
-            $status_input = $record['status']; // Keep original for messages
+            $status_input = $record['status'];         // Keep original for status checks
+            // comm_channel from record, or system default if not provided in record
+            $comm_channel_input = $record['comm_channel'] ?? $defaultCommChannelSystem;
 
             $student_id = mysqli_real_escape_string($db, $student_id_input);
             $status = mysqli_real_escape_string($db, $status_input);
+            // Sanitize comm_channel as well, though its use is for logic, not SQL directly here.
+            // Validate comm_channel against allowed values.
+            $allowedCommChannels = ['sms', 'whatsapp', 'both', 'none'];
+            if (!in_array(strtolower($comm_channel_input), $allowedCommChannels)) {
+                error_log("Invalid comm_channel '{$comm_channel_input}' for student {$student_id_input}. Defaulting to system default '{$defaultCommChannelSystem}'.");
+                $comm_channel_input = $defaultCommChannelSystem;
+            }
 
 
             if (!in_array(strtolower($status_input), $allowedStatuses)) {
@@ -180,71 +199,98 @@ function handleMarkAttendance(mysqli $db) {
                             s.student_id = '$student_id'
                         LIMIT 1";
 
-                    $smsDataResult = $db->query($smsDataSql);
+                        $smsDataResult = $db->query($smsDataSql); // This SQL should fetch all common data
                     if ($smsDataResult && $smsDataResult->num_rows > 0) {
-                        $smsData = $smsDataResult->fetch_assoc();
+                            $commonSmsData = $smsDataResult->fetch_assoc();
                         $smsDataResult->free();
 
-                        $dailySmsTemplate = get_sms_setting($db, 'daily_absent_sms_template');
-                        $schoolPhone = get_sms_setting($db, 'school_phone');
-
-                        if ($dailySmsTemplate && !empty($smsData['parent_mobile_number'])) {
-                            $formattedCurrDate = date("d M Y", strtotime($date)); // Format date for display
+                            $schoolPhone = get_sms_setting($db, 'school_phone'); // Common for both
+                            $formattedCurrDate = date("d M Y", strtotime($date)); // Common for both
 
                             $placeholders = [
-                                '{parent_name}' => $smsData['parent_name'],
-                                '{student_name}' => $smsData['student_name'],
-                                '{roll_name}' => $smsData['roll_name'] ? $smsData['roll_name'] : 'N/A',
+                                '{parent_name}' => $commonSmsData['parent_name'],
+                                '{student_name}' => $commonSmsData['student_name'],
+                                '{roll_name}' => $commonSmsData['roll_name'] ? $commonSmsData['roll_name'] : 'N/A',
                                 '{curr_date}' => $formattedCurrDate,
-                                '{absent_count_curr_year}' => $smsData['absent_count_curr_year'],
-                                '{absent_count_curr_month}' => $smsData['absent_count_curr_month'],
+                                '{absent_count_curr_year}' => $commonSmsData['absent_count_curr_year'],
+                                '{absent_count_curr_month}' => $commonSmsData['absent_count_curr_month'],
                                 '{school_phone}' => $schoolPhone ? $schoolPhone : 'the school',
-                                '{class_teacher_name}' => $smsData['class_teacher_name'],
+                                '{class_teacher_name}' => $commonSmsData['class_teacher_name'],
                             ];
-                            $smsMessage = str_replace(array_keys($placeholders), array_values($placeholders), $dailySmsTemplate);
 
-                            if (send_sms($db, $smsData['parent_mobile_number'], $smsMessage)) {
-                                $smsNotificationsSent++;
-                                error_log("Daily absent SMS sent successfully to " . $smsData['parent_mobile_number'] . " for student " . $student_id_input);
+                            // Send SMS if channel is 'sms' or 'both'
+                            if (strtolower($comm_channel_input) === 'sms' || strtolower($comm_channel_input) === 'both') {
+                                $dailySmsTemplate = get_sms_setting($db, 'daily_absent_sms_template');
+                                if ($dailySmsTemplate && !empty($commonSmsData['parent_mobile_number'])) {
+                                    $smsMessage = str_replace(array_keys($placeholders), array_values($placeholders), $dailySmsTemplate);
+                                    if (send_sms($db, $commonSmsData['parent_mobile_number'], $smsMessage)) {
+                                        $smsNotificationsSent++;
+                                        error_log("Daily absent SMS sent to " . $commonSmsData['parent_mobile_number'] . " for student " . $student_id_input);
+                                    } else {
+                                        $smsNotificationsFailed++;
+                                        error_log("Failed to send daily absent SMS to " . $commonSmsData['parent_mobile_number'] . " for student " . $student_id_input);
+                                    }
                             } else {
                                 $smsNotificationsFailed++;
-                                error_log("Failed to send daily absent SMS to " . $smsData['parent_mobile_number'] . " for student " . $student_id_input . ". Check SMS gateway logs.");
+                                    error_log("Cannot send SMS for student " . $student_id_input . (empty($commonSmsData['parent_mobile_number']) ? ": Parent mobile missing." : ": SMS template missing."));
                             }
-                        } else {
-                            if(empty($smsData['parent_mobile_number'])) {
-                                error_log("Cannot send daily absent SMS for student " . $student_id_input . ": Parent mobile number not found.");
                             }
-                            if(!$dailySmsTemplate) {
-                                error_log("Cannot send daily absent SMS for student " . $student_id_input . ": Daily SMS template not found in settings.");
+
+                            // Send WhatsApp if channel is 'whatsapp' or 'both'
+                            if (strtolower($comm_channel_input) === 'whatsapp' || strtolower($comm_channel_input) === 'both') {
+                                $dailyWhatsappTemplate = get_sms_setting($db, 'daily_absent_whatsapp_template');
+                                // CUSTOMIZATION: WhatsApp might use template names instead of full text for $dailyWhatsappTemplate
+                                // For this example, assume $dailyWhatsappTemplate is the full message text.
+                                // If using WhatsApp template names, $dailyWhatsappTemplate would be the template name,
+                                // and $placeholders would be converted to the format send_whatsapp_message expects for template_params.
+                                if ($dailyWhatsappTemplate && !empty($commonSmsData['parent_mobile_number'])) {
+                                    // For WhatsApp, the message body itself might be the template identifier, or you might pass parameters separately.
+                                    // This example directly replaces placeholders in the template string.
+                                    // Your send_whatsapp_message function might need adaptation if it uses structured templates.
+                                    $whatsappMessage = str_replace(array_keys($placeholders), array_values($placeholders), $dailyWhatsappTemplate);
+
+                                    // Example of passing template name and params if your send_whatsapp_message supports it:
+                                    // $templateNameForApi = "daily_absence_notification_v1"; // The actual name registered with WhatsApp
+                                    // $templateParamsForApi = [$commonSmsData['parent_name'], $commonSmsData['student_name'], ...];
+                                    // if (send_whatsapp_message($db, $commonSmsData['parent_mobile_number'], "", $templateNameForApi, $templateParamsForApi)) {
+                                    if (send_whatsapp_message($db, $commonSmsData['parent_mobile_number'], $whatsappMessage)) { // Simpler direct message send
+                                        $whatsappNotificationsSent++;
+                                        error_log("Daily absent WhatsApp sent to " . $commonSmsData['parent_mobile_number'] . " for student " . $student_id_input);
+                                    } else {
+                                        $whatsappNotificationsFailed++;
+                                        error_log("Failed to send daily absent WhatsApp to " . $commonSmsData['parent_mobile_number'] . " for student " . $student_id_input);
+                                    }
+                                } else {
+                                    $whatsappNotificationsFailed++;
+                                    error_log("Cannot send WhatsApp for student " . $student_id_input . (empty($commonSmsData['parent_mobile_number']) ? ": Parent mobile missing." : ": WhatsApp template missing."));
                             }
-                            $smsNotificationsFailed++;
                         }
-                    } else {
-                        error_log("Failed to fetch SMS data for student " . $student_id_input . ". SQL Error: " . $db->error);
-                        $smsNotificationsFailed++;
+
+                        } else { // Failed to fetch common SMS/WhatsApp data
+                            error_log("Failed to fetch notification data for student " . $student_id_input . ". SQL Error: " . $db->error);
+                            if (strtolower($comm_channel_input) === 'sms' || strtolower($comm_channel_input) === 'both') $smsNotificationsFailed++;
+                            if (strtolower($comm_channel_input) === 'whatsapp' || strtolower($comm_channel_input) === 'both') $whatsappNotificationsFailed++;
                     }
                 } // end if status is 'absent'
 
-            } else {
-                // **SECURITY WARNING:** Do not expose $db->error directly to clients in production.
-                // Log it securely on the server.
+                } else { // Attendance DB query failed
                 $failedRecords[] = ['student_id' => $student_id_input, 'error' => 'Database error during insert/update.'];
                 error_log("Attendance DB Error for student $student_id_input on $date: " . $db->error);
             }
         } // end foreach
 
-        $finalMessage = "";
         $responseCode = 0;
+            $finalMessageData = [];
 
         if (count($failedRecords) > 0 && $successfulInserts === 0) {
             $db->rollback();
-            $responseCode = 400; // Or 500 if server-side errors caused all failures
+                $responseCode = 400;
             $finalMessageData = [
                 'error' => 'Failed to mark attendance for all records.',
                 'failed_records' => $failedRecords
             ];
         } elseif (count($failedRecords) > 0) {
-            $db->commit(); // Commit successful ones
+                $db->commit();
             $responseCode = 207; // Multi-Status
             $finalMessageData = [
                 'message' => 'Attendance marked with some failures.',

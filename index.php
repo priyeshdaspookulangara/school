@@ -10,6 +10,7 @@ require_once __DIR__ . '/includes/auth.php';
 // or include it directly within handlers that need it.
 // For now, specific handlers (attendance, sms_alert) already include it.
 // require_once __DIR__ . '/includes/sms_gateway.php';
+// require_once __DIR__ . '/includes/whatsapp_gateway.php'; // Also included by specific handlers
 
 
 // Get the request method and path
